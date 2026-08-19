@@ -1,0 +1,1 @@
+{"detail": "smoketest_warmup", "num_prompts": 5, "output_len": 100, "input_len": 200, "run_idx": 2, "num_gpus": 2, "engine_metrics_captured": true, "t0_monotonic": 174163.210159531}

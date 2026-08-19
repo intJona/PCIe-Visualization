@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Example reference scripts -- not part of this project, kept local only
+example scripts (do not git)/

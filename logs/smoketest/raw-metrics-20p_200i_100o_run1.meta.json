@@ -1,0 +1,1 @@
+{"detail": "smoketest", "num_prompts": 20, "output_len": 100, "input_len": 200, "run_idx": 1, "num_gpus": 2, "engine_metrics_captured": true, "t0_monotonic": 171303.603248252}
