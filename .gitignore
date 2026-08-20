@@ -4,3 +4,6 @@ __pycache__/
 
 # Example reference scripts -- not part of this project, kept local only
 example scripts (do not git)/
+
+# Generated benchmark output -- regenerable via bench_run.py, would grow unbounded in history
+logs/
