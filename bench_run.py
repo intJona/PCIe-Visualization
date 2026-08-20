@@ -9,7 +9,12 @@ Scales to any number of GPUs (pynvml.nvmlDeviceGetCount()) -- no hardcoded GPU c
 Per run, writes into ./logs/<detail>/:
   bench-<N>p_<I>i_<O>o_run<R>.json          vLLM's own --save-result output
   raw-metrics-<N>p_<I>i_<O>o_run<R>.csv     timestamp, and per GPU: total_pcie/h2d_mb/d2h_mb/sm_util/mem_util
-  engine-metrics-<N>p_<I>i_<O>o_run<R>.csv  timestamp, num_requests_running/waiting, kv_cache_usage_perc, num_preemptions_total, num_requests_completed
+  engine-metrics-<N>p_<I>i_<O>o_run<R>.csv  timestamp, num_requests_running/waiting, kv_cache_usage_perc,
+    num_preemptions_total, num_requests_completed (cumulative since this run started),
+    avg_prefill_time_seconds, avg_queue_time_seconds, prefill_samples_count (number of requests
+    whose prefill completed since the PREVIOUS sample -- a per-interval count, NOT the same as
+    num_requests_completed; avg_* is EXACT for that one request when this is 1, else the mean
+    over however many completed in that interval)
   raw-metrics-<N>p_<I>i_<O>o_run<R>.meta.json  t0_monotonic, input_len, output_len, num_gpus, etc.
 
 Usage:
@@ -38,7 +43,24 @@ ENGINE_METRIC_PATTERNS = {
     # baselined to each run's first sample in poll_engine_metrics() so the CSV shows "completed
     # since this run started", not a huge near-flat count from every prior run against this server.
     "request_success_total": re.compile(r"^vllm:request_success_total\{[^}]*\}\s+([0-9.eE+-]+)", re.MULTILINE),
+    # request_prefill_time_seconds / request_queue_time_seconds are Prometheus Histograms, not
+    # gauges -- /metrics never exposes individual observations, only cumulative _sum/_count (plus
+    # _bucket lines, which we don't need). Also lifetime-cumulative, so diffed against the
+    # PREVIOUS sample (not the run-start baseline) in poll_engine_metrics() -- diffing against
+    # the run-start baseline instead would make avg_prefill_time/avg_queue_time a slowly
+    # converging running average over the whole run rather than a per-sample-window snapshot.
+    # prefill_time = first_token_ts - scheduled_ts (excludes queue wait, unlike TTFT) -- the
+    # accurate "how long did loading+processing the input prompt take" metric.
+    "prefill_time_sum": re.compile(r"^vllm:request_prefill_time_seconds_sum\{[^}]*\}\s+([0-9.eE+-]+)", re.MULTILINE),
+    "prefill_time_count": re.compile(r"^vllm:request_prefill_time_seconds_count\{[^}]*\}\s+([0-9.eE+-]+)", re.MULTILINE),
+    "queue_time_sum": re.compile(r"^vllm:request_queue_time_seconds_sum\{[^}]*\}\s+([0-9.eE+-]+)", re.MULTILINE),
+    "queue_time_count": re.compile(r"^vllm:request_queue_time_seconds_count\{[^}]*\}\s+([0-9.eE+-]+)", re.MULTILINE),
 }
+
+# Lifetime-cumulative metrics that must be baselined to each run's first sample (see comments above).
+CUMULATIVE_METRICS = (
+    "request_success_total", "prefill_time_sum", "prefill_time_count", "queue_time_sum", "queue_time_count",
+)
 
 
 class GpuProbe:
@@ -92,10 +114,14 @@ def csv_header(n_gpus):
     return ",".join(cols)
 
 
-def gpu_monitor(rows, stop_event, start_time, anchor_holder, sample_interval=0.05):
-    """Poll every GPU on a fixed interval until stop_event is set. anchor_holder is filled in
-    with num_gpus and the CLOCK_MONOTONIC reading at t=0 (used to align against vLLM's own
-    'start_times', which are CLOCK_MONOTONIC too)."""
+def gpu_monitor(rows, stop_event, start_time, anchor_holder, sample_interval=0.02):
+    """Poll every GPU on a fixed interval until stop_event is set. anchor_holder already holds
+    t0_monotonic (set by the caller at the exact same instant as start_time, before this thread
+    even started -- NVML init / GPM probe setup below can take a non-trivial amount of time, so
+    capturing t0_monotonic here instead would skew it away from the CSV's true t=0 by however
+    long that setup took). This function only fills in num_gpus.
+    sample_interval default of 0.02s (20ms) matches NVML's own internal averaging window for
+    nvmlDeviceGetPcieThroughput -- polling faster just re-reads the same stale value."""
     try:
         pynvml.nvmlInit()
         n_gpus = pynvml.nvmlDeviceGetCount()
@@ -106,7 +132,6 @@ def gpu_monitor(rows, stop_event, start_time, anchor_holder, sample_interval=0.0
         return
 
     anchor_holder["num_gpus"] = n_gpus
-    anchor_holder["t0_monotonic"] = time.monotonic()
     error_count, last_error = 0, None
     while not stop_event.is_set():
         try:
@@ -131,7 +156,8 @@ def poll_engine_metrics(rows, stop_event, base_url, start_time, sample_interval=
     """Poll vLLM's own /metrics endpoint for engine-side state. Disables itself (returns) the
     first time the endpoint is unreachable -- best-effort enrichment, never fatal."""
     url = base_url.rstrip("/") + "/metrics"
-    completed_baseline = None
+    baseline = None
+    prev = None
     while not stop_event.is_set():
         try:
             with urllib.request.urlopen(url, timeout=1.0) as resp:
@@ -150,14 +176,28 @@ def poll_engine_metrics(rows, stop_event, base_url, start_time, sample_interval=
             else:
                 values[name] = sum(matches)
 
-        if completed_baseline is None:
-            completed_baseline = values["request_success_total"]
-        completed_this_run = values["request_success_total"] - completed_baseline
+        if baseline is None:
+            baseline = {k: values[k] for k in CUMULATIVE_METRICS}
+            prev = dict(baseline)
+        completed_this_run = values["request_success_total"] - baseline["request_success_total"]
+        # Windowed deltas (since the PREVIOUS sample, not run start) -- see the CUMULATIVE_METRICS
+        # comment above for why run-start baselining would be wrong here.
+        prefill_sum_delta = values["prefill_time_sum"] - prev["prefill_time_sum"]
+        prefill_count_delta = values["prefill_time_count"] - prev["prefill_time_count"]
+        queue_sum_delta = values["queue_time_sum"] - prev["queue_time_sum"]
+        queue_count_delta = values["queue_time_count"] - prev["queue_time_count"]
+        # avg_*_time is exact for a single request when its matching count delta is 1 (e.g. the
+        # 1-prompt warm-up run, or the only request to complete between two samples); otherwise
+        # it's the mean over however many requests completed since the previous sample.
+        avg_prefill_time = prefill_sum_delta / prefill_count_delta if prefill_count_delta > 0 else float("nan")
+        avg_queue_time = queue_sum_delta / queue_count_delta if queue_count_delta > 0 else float("nan")
+        prev = {k: values[k] for k in CUMULATIVE_METRICS}
 
         rows.append([
             time.time() - start_time,
             values["num_requests_running"], values["num_requests_waiting"],
             values["kv_cache_usage_perc"], values["num_preemptions_total"], completed_this_run,
+            avg_prefill_time, avg_queue_time, prefill_count_delta,
         ])
         stop_event.wait(sample_interval)
 
@@ -190,8 +230,15 @@ def run_bench(detail, num_prompts, output_len, input_len, run_idx, engine_metric
     # silently overwrite a previous run's files.
     run_id = f"{num_prompts}p_{input_len}i_{output_len}o_run{run_idx}"
 
-    gpu_rows, engine_rows, stop_event, anchor = [], [], Event(), {}
+    gpu_rows, engine_rows, stop_event = [], [], Event()
+    # Captured together, back-to-back, in the main thread -- BEFORE any thread/NVML/subprocess
+    # work starts -- so t0_monotonic is guaranteed to correspond to the exact same real-world
+    # instant as start_time (the CSV's own t=0). Letting gpu_monitor() capture t0_monotonic
+    # itself (the old approach) meant it was measured after NVML init + per-GPU GPM probe setup
+    # had already run in that thread, silently skewing every aligned timestamp by however long
+    # that setup took.
     start_time = time.time()
+    anchor = {"t0_monotonic": time.monotonic()}
     gpu_thread = Thread(target=gpu_monitor, args=(gpu_rows, stop_event, start_time, anchor))
     gpu_thread.start()
 
@@ -231,7 +278,8 @@ def run_bench(detail, num_prompts, output_len, input_len, run_idx, engine_metric
         engine_path = log_dir / f"engine-metrics-{run_id}.csv"
         with open(engine_path, "w") as f:
             f.write("timestamp,num_requests_running,num_requests_waiting,kv_cache_usage_perc,"
-                    "num_preemptions_total,num_requests_completed\n")
+                    "num_preemptions_total,num_requests_completed,avg_prefill_time_seconds,"
+                    "avg_queue_time_seconds,prefill_samples_count\n")
             f.write("\n".join(",".join(map(str, row)) for row in engine_rows))
         print(f"Engine metrics saved: {engine_path}")
 
