@@ -7,7 +7,7 @@ CSVs and .meta.json sidecar). Each distinct (topic, prompts, input_len, output_l
 is its own selectable "configuration" -- prompts/input/output are part of the filename and the
 configuration label, not a separate cascading filter -- and each configuration gets its own
 independent run-number picker. Renders a 3-row shared-x-axis figure: PCIe bandwidth,
-hardware/engine utilization, request lifecycle timeline (cumulative tokens + per-request TTFT),
+engine utilization (KV cache %), request lifecycle timeline (cumulative tokens + per-request TTFT),
 plus a run-level summary table for server-measured prefill/queue time (see below for why that's
 a table and not a fourth thing plotted on the timeline).
 
@@ -42,15 +42,19 @@ maximal regardless of how many runs happen to be selected.
   Row 3 (per-run only: tokens, TTFT -- no GPU dimension, same in both modes) -- Configuration ->
     hue, Run -> lightness within it. TTFT keeps its own "x" marker (see below), unrelated to run
     identity -- it's the one deliberate marker left in the whole figure.
-Metric type itself (Total PCIe/Tx vs Rx, SM vs Mem vs KV) always maps to line dash style,
-independent of mode, since it identifies *what signal* a trace is, not *which instance*.
+Metric type itself (Total PCIe/Tx vs Rx, KV) always maps to line dash style, independent of
+mode, since it identifies *what signal* a trace is, not *which instance*. SM/memory-controller
+utilization is captured in raw-metrics CSVs but deliberately NOT plotted here -- on hardware
+without NVML GPM support (this workstation's GPUs) it's nvmlDeviceGetUtilizationRates(), a
+coarse "was any kernel running" bit that pins near 100% under continuous batching and is easy
+to misread as true SM occupancy without that context.
 
 The GPU dimension has its own segmented control -- "GPU N" / "All GPUs" / "Total (Sum)" -- above
-the PCIe/Utilization rows. "Total (Sum)" collapses every selected GPU into one line per run
-(PCIe bytes summed, utilization % averaged) using that run's Configuration/Run color, since
-there's no per-GPU distinction left to encode. "GPU N" reveals a secondary picker: a multiselect
-in single_mode (pick several specific GPUs at once) but only a single-select dropdown in
-multi_mode (color there is already spoken for by Configuration/Run, so a second freely-varying
+the PCIe row (Row 2/KV cache has no GPU dimension -- it's per-run). "Total (Sum)" collapses
+every selected GPU into one PCIe line per run (bytes summed) using that run's Configuration/Run
+color, since there's no per-GPU distinction left to encode. "GPU N" reveals a secondary picker: a
+multiselect in single_mode (pick several specific GPUs at once) but only a single-select dropdown
+in multi_mode (color there is already spoken for by Configuration/Run, so a second freely-varying
 per-GPU channel has nowhere to go without colliding). The PCIe metric picker mirrors this: "Total
 / TX / RX / TX+RX" in single_mode, but "TX+RX" (both at once) is removed in multi_mode for the
 same reason -- Tx and Rx would render in the identical Configuration/Run color and become
@@ -79,9 +83,11 @@ multiselect keeps a per-item swatch (hue_for() on that configuration's global ra
 the one dimension whose color role stays the same in every mode.
 
 Sidebar order: Configurations, then a per-configuration run picker (this pair also feeds the
-single_mode/multi_mode state machine), then the GPU dimension control, then Row 1 (PCIe) and
-Row 2 (utilization) pickers, so each widget appears in the same top-to-bottom order it affects
-the plot.
+single_mode/multi_mode state machine), then the GPU dimension control, then a "Rows to Display"
+toggle (hide a row entirely to reclaim its vertical space -- the figure's row count/heights are
+rebuilt from whichever rows are still on, see row_index in main()), then Row 1 (PCIe) and
+Row 2 (engine utilization) pickers, so each widget appears in the same top-to-bottom order it
+affects the plot.
 
 Usage:
   streamlit run dashboard.py
@@ -267,36 +273,25 @@ def clip_negative_time(cols):
     return {k: v[start:] for k, v in cols.items()}
 
 
-def add_pcie_util_traces(fig, ts, total, d2h, h2d, sm, mem, color, label,
-                          pcie_mode, show_sm, show_mem):
-    """Add one GPU-or-aggregate line's worth of Row 1 (PCIe)/Row 2 (utilization) traces.
+def add_pcie_util_traces(fig, ts, total, d2h, h2d, color, label, pcie_mode, row):
+    """Add one GPU-or-aggregate line's worth of PCIe traces to the given (dynamic) subplot row.
     Shared by the per-GPU loop and the "Total (Sum)" aggregate path so both stay in sync.
     Plain lines, no markers -- color/shade/dash alone carry the encoding (see shade_color())."""
     if pcie_mode == "Total":
         fig.add_trace(go.Scatter(
             x=ts, y=total, mode="lines", line=dict(color=color, width=3, dash="solid"),
             name=f"{label} Total PCIe", showlegend=False,
-        ), row=1, col=1)
+        ), row=row, col=1)
     if pcie_mode in ("TX", "TX+RX"):
         fig.add_trace(go.Scatter(  # Tx (D2H): solid, so Total-only vs Tx-shown stays visually distinct
             x=ts, y=d2h, mode="lines", line=dict(color=color, width=3.2, dash="solid"),
             name=f"{label} Tx (D2H)", showlegend=False,
-        ), row=1, col=1)
+        ), row=row, col=1)
     if pcie_mode in ("RX", "TX+RX"):
         fig.add_trace(go.Scatter(  # Rx (H2D): dashed, so it stays distinct from Tx even in the same color
             x=ts, y=h2d, mode="lines", line=dict(color=color, width=2.4, dash="dash"),
             name=f"{label} Rx (H2D)", showlegend=False,
-        ), row=1, col=1)
-    if show_sm:
-        fig.add_trace(go.Scatter(
-            x=ts, y=sm, mode="lines", line=dict(color=color, width=3.2, dash="solid"),
-            name=f"{label} SM Compute %", showlegend=False,
-        ), row=2, col=1)
-    if show_mem:
-        fig.add_trace(go.Scatter(  # Mem: dashed, so it stays distinct from SM even in the same color
-            x=ts, y=mem, mode="lines", line=dict(color=color, width=2.4, dash="dash"),
-            name=f"{label} Mem Controller %", showlegend=False,
-        ), row=2, col=1)
+        ), row=row, col=1)
 
 
 def main():
@@ -361,8 +356,8 @@ def main():
     st.sidebar.header("GPUs")
     gpu_view = st.sidebar.segmented_control(
         "View", ["GPU N", "All GPUs", "Total (Sum)"], default="All GPUs", required=True,
-        help="GPU N picks specific GPU(s). Total (Sum) sums PCIe / averages utilization across "
-             "every GPU into a single line.",
+        help="GPU N picks specific GPU(s). Total (Sum) sums PCIe bytes across every GPU into a "
+             "single line (affects Row 1 only -- KV cache is already per-run, not per-GPU).",
     )
     if gpu_view == "GPU N" and max_gpus_available:
         if single_mode:
@@ -381,7 +376,19 @@ def main():
     gpu_aggregate = gpu_view == "Total (Sum)"
     selected_gpus = set(gpu_list)
     if max_gpus_available and not selected_gpus:
-        st.sidebar.caption("No GPU selected -- PCIe/Utilization rows will show only KV cache/tokens.")
+        st.sidebar.caption("No GPU selected -- the PCIe row will be empty (Engine Utilization "
+                            "and Request Lifecycle are per-run, not per-GPU, so unaffected).")
+
+    st.sidebar.header("Rows to Display")
+    row_choices = st.sidebar.pills(
+        "Show", ["PCIe", "Engine Utilization", "Request Lifecycle"], selection_mode="multi",
+        default=["PCIe", "Engine Utilization", "Request Lifecycle"],
+        help="Hide a row entirely to reclaim vertical space -- each row's own controls below "
+             "still apply whenever it's shown again.",
+    )
+    show_pcie_row = "PCIe" in row_choices
+    show_util_row = "Engine Utilization" in row_choices
+    show_lifecycle_row = "Request Lifecycle" in row_choices
 
     st.sidebar.header("Row 1: PCIe Data Transfer")
     # TX+RX (both at once) is only offered in single-run view -- in multi-run view Run already
@@ -392,20 +399,18 @@ def main():
         "Show", pcie_options, default="Total", required=True,
         key=f"pcie_mode_{'single' if single_mode else 'multi'}",
         help="TX = device-to-host, RX = host-to-device.",
+        disabled=not show_pcie_row,
     )
 
-    st.sidebar.header("Row 2: Hardware / Engine Utilization")
-    util_selected = st.sidebar.pills(
-        "Show", ["SM", "Mem", "KV"], selection_mode="multi", default=["SM", "KV"],
-        help="SM/Mem are per-GPU; KV cache is per-run.",
-    )
-    show_sm, show_mem, show_kv = "SM" in util_selected, "Mem" in util_selected, "KV" in util_selected
+    st.sidebar.header("Row 2: Engine Utilization")
+    show_kv = True    
+    st.sidebar.caption("Always on when shown: KV cache % (from /metrics CSVs) and preemption events (from engine-metrics CSVs). ")
+
 
     st.sidebar.header("Row 3: Request Lifecycle")
-    st.sidebar.caption("Always on: token timeline + per-request TTFT (from vLLM bench's own "
-                        "client data). Server-measured prefill/queue time is in the summary "
-                        "table below the chart instead -- vLLM only records it at request "
-                        "completion, so it has no honest instant on this timeline.")
+    st.sidebar.caption("Always on when shown: token timeline + per-request TTFT (from vLLM "
+                        "bench's own client data). Server-measured prefill/queue time is in the "
+                        "summary table below the chart instead.")
 
     if single_mode:
         st.sidebar.caption("Single-run view -- color = GPU, shade = Configuration. "
@@ -444,29 +449,43 @@ def main():
         return
     single_run = len(loaded) == 1
 
+    # Dynamic row layout -- only rows toggled on in "Rows to Display" get a subplot slot, so
+    # hiding a row reclaims its vertical space instead of leaving a blank panel. row_index maps
+    # each row's fixed name to its ACTUAL 1-based position in this figure (which shifts once any
+    # earlier row is hidden), so every add_trace/add_vrect/add_vline call below stays correct.
+    row_defs = [
+        ("pcie", "PCIe Data Transfer (MiB/s)", 0.4, show_pcie_row),
+        ("util", "Engine Utilization (%)", 0.3, show_util_row),
+        ("lifecycle", "Request Lifecycle Timeline", 0.3, show_lifecycle_row),
+    ]
+    active_rows = [(name, title, weight) for name, title, weight, shown in row_defs if shown]
+    if not active_rows:
+        st.info("Select at least one row in \"Rows to Display\".")
+        return
+    row_index = {name: i + 1 for i, (name, _, _) in enumerate(active_rows)}
+    bottom_row = len(active_rows)
+
     fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.4, 0.3, 0.3],
-        subplot_titles=("PCIe Data Transfer (MiB/s)", "Hardware / Engine Utilization (%)",
-                         "Request Lifecycle Timeline"),
+        rows=bottom_row, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        row_heights=[w for _, _, w in active_rows],
+        subplot_titles=[t for _, t, _ in active_rows],
     )
     summary_rows = []
 
     for key, entry, data, color, label in loaded:
         csv_cols, n_gpus = data["csv_cols"], data["n_gpus"]
-        if csv_cols is not None and n_gpus:
+        if "pcie" in row_index and csv_cols is not None and n_gpus:
+            pcie_row = row_index["pcie"]
             ts = csv_cols["timestamp"]
             gpus_here = [g for g in range(n_gpus) if g in selected_gpus]
             if gpu_aggregate and gpus_here:
                 # No GPU dimension left once summed -- reuse the same Configuration=hue/Run=
                 # shade color Row 3 uses below, since there's nothing else left to encode.
-                n = len(gpus_here)
                 total = [sum(csv_cols[f"total_pcie{g}"][i] for g in gpus_here) for i in range(len(ts))]
                 d2h = [sum(csv_cols[f"d2h_mb{g}"][i] for g in gpus_here) for i in range(len(ts))]
                 h2d = [sum(csv_cols[f"h2d_mb{g}"][i] for g in gpus_here) for i in range(len(ts))]
-                sm = [sum(csv_cols[f"sm_util{g}"][i] for g in gpus_here) / n for i in range(len(ts))]
-                mem = [sum(csv_cols[f"mem_util{g}"][i] for g in gpus_here) / n for i in range(len(ts))]
-                add_pcie_util_traces(fig, ts, total, d2h, h2d, sm, mem, color,
-                                      f"{label} \u03a3GPUs", pcie_mode, show_sm, show_mem)
+                add_pcie_util_traces(fig, ts, total, d2h, h2d, color,
+                                      f"{label} \u03a3GPUs", pcie_mode, pcie_row)
             else:
                 for gpu_i in gpus_here:
                     # Single-run view: GPU owns hue outright (Configuration/Run can't vary --
@@ -477,22 +496,23 @@ def main():
                     gpu_label = f"{label} GPU{gpu_i}"
                     add_pcie_util_traces(
                         fig, ts, csv_cols[f"total_pcie{gpu_i}"], csv_cols[f"d2h_mb{gpu_i}"],
-                        csv_cols[f"h2d_mb{gpu_i}"], csv_cols[f"sm_util{gpu_i}"],
-                        csv_cols[f"mem_util{gpu_i}"], gpu_color, gpu_label,
-                        pcie_mode, show_sm, show_mem,
+                        csv_cols[f"h2d_mb{gpu_i}"], gpu_color, gpu_label, pcie_mode, pcie_row,
                     )
 
-        if data["engine_cols"] is not None:
+        if "util" in row_index and data["engine_cols"] is not None:
+            util_row = row_index["util"]
             ec = data["engine_cols"]
             if show_kv:
-                fig.add_trace(go.Scatter(  # KV cache is per-run (not per-GPU): dotted, distinct from SM/Mem
+                fig.add_trace(go.Scatter(  # KV cache is per-run (not per-GPU)
                     x=ec["timestamp"], y=[v * 100 for v in ec["kv_cache_usage_perc"]], mode="lines",
                     line=dict(color=color, width=3, dash="dot"),
                     name=f"{label} KV Cache %", showlegend=False,
-                ), row=2, col=1)
+                ), row=util_row, col=1)
             for pt in data["preempt_events"]:
-                fig.add_vline(x=pt, line_dash="dash", line_color=color, opacity=0.6, row=2, col=1)
+                fig.add_vline(x=pt, line_dash="dash", line_color=color, opacity=0.6, row=util_row, col=1)
 
+        if data["engine_cols"] is not None:
+            ec = data["engine_cols"]
             # Prefill/queue time used to be plotted as sparse markers on this timeline, but their
             # x-position is always "when vLLM recorded the sample" (request completion), not when
             # prefill/queue actually happened -- there's no honest instant on this timeline for
@@ -513,18 +533,20 @@ def main():
                         "Mean queue (s)": round(queue_mean, 4),
                     })
 
-        fig.add_trace(go.Scatter(
-            x=data["events"], y=data["token_counts"], mode="lines",
-            line=dict(color=color, width=3), name=f"{label} Tokens", showlegend=False,
-        ), row=3, col=1)
-        if data["ttft_markers"]:
-            xs_ttft, ys_ttft, vals_ttft = zip(*data["ttft_markers"])
+        if "lifecycle" in row_index:
+            lifecycle_row = row_index["lifecycle"]
             fig.add_trace(go.Scatter(
-                x=list(xs_ttft), y=list(ys_ttft), mode="markers",
-                marker=dict(symbol="x", size=10, color=color, line=dict(width=1.5)),
-                text=[f"{v:.3f}s" for v in vals_ttft], hovertemplate="TTFT %{text}<extra></extra>",
-                name=f"{label} TTFT (per-request)", showlegend=False,
-            ), row=3, col=1)
+                x=data["events"], y=data["token_counts"], mode="lines",
+                line=dict(color=color, width=3), name=f"{label} Tokens", showlegend=False,
+            ), row=lifecycle_row, col=1)
+            if data["ttft_markers"]:
+                xs_ttft, ys_ttft, vals_ttft = zip(*data["ttft_markers"])
+                fig.add_trace(go.Scatter(
+                    x=list(xs_ttft), y=list(ys_ttft), mode="markers",
+                    marker=dict(symbol="x", size=10, color=color, line=dict(width=1.5)),
+                    text=[f"{v:.3f}s" for v in vals_ttft], hovertemplate="TTFT %{text}<extra></extra>",
+                    name=f"{label} TTFT (per-request)", showlegend=False,
+                ), row=lifecycle_row, col=1)
 
     # Prefill/decode phase shading is only meaningful for a single displayed run -- with more
     # than one run active, overlapping vrects from different runs would stack into a visually
@@ -532,42 +554,56 @@ def main():
     if single_run:
         _, entry, data, color, label = loaded[0]
         run_end = data["events"][-1] if data["events"] else data["ttft"]
-        # Annotation text only on row 1 -- row="all" would otherwise repeat the same label on
-        # every subplot row, which is redundant clutter since the x-axis is shared.
-        fig.add_vrect(x0=0, x1=data["ttft"], fillcolor="#FFEB3B", opacity=0.28, line_width=0,
-                      row=1, col=1, annotation_text="Prefill (TTFT)", annotation_position="top left")
-        fig.add_vrect(x0=data["ttft"], x1=run_end, fillcolor="#66BB6A", opacity=0.22, line_width=0,
-                      row=1, col=1, annotation_text="Decode", annotation_position="top left")
-        fig.add_vrect(x0=0, x1=data["ttft"], fillcolor="#FFEB3B", opacity=0.28, line_width=0, row=2, col=1)
-        fig.add_vrect(x0=data["ttft"], x1=run_end, fillcolor="#66BB6A", opacity=0.22, line_width=0, row=2, col=1)
-        fig.add_vrect(x0=0, x1=data["ttft"], fillcolor="#FFEB3B", opacity=0.28, line_width=0, row=3, col=1)
-        fig.add_vrect(x0=data["ttft"], x1=run_end, fillcolor="#66BB6A", opacity=0.22, line_width=0, row=3, col=1)
+        # Annotation text only on the topmost active row -- row="all" would otherwise repeat the
+        # same label on every subplot row, which is redundant clutter since x is shared.
+        top_row = min(row_index.values())
+        for row in row_index.values():
+            annotate = True # show on all rows to avoid "New Text" clutter on other rows, but can be set to "row == top_row" if you want to only annotate the top row
+            fig.add_vrect(x0=0, x1=data["ttft"], fillcolor="#FFEB3B", opacity=0.28, line_width=0,
+                          row=row, col=1,
+                          annotation_text="Prefill (TTFT)" if annotate else None,
+                          annotation_position="top left")
+            fig.add_vrect(x0=data["ttft"], x1=run_end, fillcolor="#66BB6A", opacity=0.22, line_width=0,
+                          row=row, col=1,
+                          annotation_text="Decode" if annotate else None,
+                          annotation_position="top left")
 
-    fig.update_yaxes(title_text="MiB/s", row=1, col=1)
-    fig.update_yaxes(title_text="%", row=2, col=1)
-    fig.update_yaxes(title_text="Cumulative tokens", row=3, col=1)
-    fig.update_xaxes(title_text="Time (s)", row=3, col=1)
+    if "pcie" in row_index:
+        fig.update_yaxes(title_text="MiB/s", row=row_index["pcie"], col=1)
+    if "util" in row_index:
+        fig.update_yaxes(title_text="%", row=row_index["util"], col=1)
+    if "lifecycle" in row_index:
+        fig.update_yaxes(title_text="Cumulative tokens", row=row_index["lifecycle"], col=1)
+    fig.update_xaxes(title_text="Time (s)", row=bottom_row, col=1)
     # Safety net on top of clip_negative_time()'s data trimming: autorange padding can still
     # nudge the displayed range slightly below 0 even when every sample is >= 0.
     fig.update_xaxes(rangemode="nonnegative")
     # No Plotly legend -- the sidebar is the legend now (see module docstring), and every trace
-    # above is already showlegend=False.
-    fig.update_layout(height=1400, showlegend=False)
+    # above is already showlegend=False. Height scales with how many rows are actually shown, so
+    # hiding a row reclaims real vertical space instead of leaving it blank (each row got ~467px
+    # of the original 3-row/1400px figure).
+    fig.update_layout(height=467 * bottom_row, showlegend=False)
 
-    st.plotly_chart(fig, use_container_width=True)
+    # Plotly's client-side toolbar PNG export (camera icon) is used instead of a server-side
+    # kaleido render -- it's instant and captures exactly the current view (zoom/pan included),
+    # which a server-side re-render of `fig` could never do anyway.
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={
+            "toImageButtonOptions": {
+                "format": "png",
+                "filename": "pcie_benchmark_dashboard",
+                "scale": 2,
+            }
+        },
+    )
 
     if summary_rows:
         st.caption("Server-measured prefill/queue time -- mean over every request completed "
                     "this run (vLLM's own histograms, weighted by sample count; not tied to "
                     "any single instant on the timeline above, see the Row 3 caption).")
         st.dataframe(summary_rows, use_container_width=True, hide_index=True)
-
-    try:
-        png_bytes = fig.to_image(format="png", width=1920, height=1080, engine="kaleido")
-        st.download_button("Download High-Res PNG (1920x1080)", data=png_bytes,
-                            file_name="pcie_benchmark_dashboard.png", mime="image/png")
-    except Exception as e:
-        st.caption(f"PNG export unavailable ({e}). Install the 'kaleido' package to enable it.")
 
 
 if __name__ == "__main__":

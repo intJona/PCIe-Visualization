@@ -134,6 +134,7 @@ def gpu_monitor(rows, stop_event, start_time, anchor_holder, sample_interval=0.0
     anchor_holder["num_gpus"] = n_gpus
     error_count, last_error = 0, None
     while not stop_event.is_set():
+        loop_start = time.monotonic()
         try:
             row = [time.time() - start_time]
             for p in probes:
@@ -145,7 +146,14 @@ def gpu_monitor(rows, stop_event, start_time, anchor_holder, sample_interval=0.0
             last_error = e
             if error_count == 1:
                 print(f"Warning: NVML sample failed ({e}); dropping affected samples.")
-        time.sleep(sample_interval)
+        # Subtract however long the reads themselves took -- without this, a slow NVML call
+        # (e.g. nvmlDeviceGetPcieThroughput can take ~20ms/call with persistence mode off,
+        # observed via direct benchmarking) silently stacks on TOP of the full sleep instead of
+        # being absorbed by it, so the achieved interval drifts well past sample_interval
+        # (measured ~105ms vs the intended 20ms on this workstation) instead of just being
+        # floored by whatever the reads cost.
+        elapsed = time.monotonic() - loop_start
+        stop_event.wait(max(0.0, sample_interval - elapsed))
     pynvml.nvmlShutdown()
     if error_count:
         print(f"Warning: {error_count}/{error_count + len(rows)} GPU telemetry samples were "
