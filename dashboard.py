@@ -108,11 +108,6 @@ COLOR_FAMILIES = ["Blues", "Oranges", "Greens", "Reds", "Purples", "Greys"]
 # runs looked too similar to tell apart).
 BASE_HEX = {"Blues": "#1f77b4", "Oranges": "#ff7f0e", "Greens": "#2ca02c",
             "Reds": "#d62728", "Purples": "#9467bd", "Greys": "#7f7f7f"}
-# Sidebar-as-legend: a plain-text swatch shown next to each Configuration option, built from
-# the same rank -> hue function the plot itself uses -- Configuration always owns the hue
-# channel in multi-run view, and row 3's color always, so this stays a direct match.
-FAMILY_SWATCH = {"Blues": "\U0001F7E6", "Oranges": "\U0001F7E7", "Greens": "\U0001F7E9",
-                 "Reds": "\U0001F7E5", "Purples": "\U0001F7EA", "Greys": "\u2b1c"}
 
 
 def hue_for(rank):
@@ -315,13 +310,8 @@ def main():
 
     st.sidebar.header("Configurations")
     all_keys = sorted(configs, key=lambda k: configs[k]["label"])
-    # Fixed globally over every discovered key (not just the current selection) so a given
-    # configuration's rank -- and therefore its swatch -- never shifts depending on what else is
-    # selected alongside it.
-    config_rank = {k: i for i, k in enumerate(all_keys)}
     selected_keys = st.sidebar.multiselect(
         "Topic | prompts, input/output tokens", all_keys, default=all_keys[:1],
-        format_func=lambda k: f"{FAMILY_SWATCH[hue_for(config_rank[k])]} {configs[k]['label']}",
     )
     if not selected_keys:
         st.info("Select at least one configuration.")
