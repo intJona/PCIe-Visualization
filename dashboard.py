@@ -327,6 +327,11 @@ def main():
         st.info("Select at least one configuration.")
         return
 
+    # Dynamic selection-based rank: first selected config -> color 0, second -> color 1, etc.
+    # This ensures maximum contrast (always using the full palette's distinct hues) regardless
+    # of which configs are selected or their global alphabetical order.
+    selection_rank = {k: i for i, k in enumerate(selected_keys)}
+
     # Each configuration gets its own independent run-number picker -- prompts/input/output no
     # longer need a separate cascading filter since they're already part of the configuration.
     st.sidebar.header("Runs (per configuration)")
@@ -343,7 +348,7 @@ def main():
             # per-run shade_color() as a small legend right under the picker instead -- recomputed
             # every rerun so it always reflects the CURRENT selection (shade depends on n_runs).
             run_ranks = sorted(chosen)
-            base_hex = BASE_HEX[hue_for(config_rank[key])]
+            base_hex = BASE_HEX[hue_for(selection_rank[key])]
             swatches = "&nbsp;&nbsp;".join(
                 f'<span style="color:{shade_color(base_hex, shade_factor(run_ranks.index(r), len(run_ranks)))}">\u25cf</span> run{r}'
                 for r in run_ranks
@@ -440,7 +445,7 @@ def main():
                 continue
             run_ranks = sorted(selected_runs[key])
             factor = shade_factor(run_ranks.index(entry["run"]), len(run_ranks))
-            color = shade_color(BASE_HEX[hue_for(config_rank[key])], factor)
+            color = shade_color(BASE_HEX[hue_for(selection_rank[key])], factor)
             label = f"{configs[key]['label']} run{entry['run']}"
             loaded.append((key, entry, data, color, label))
 
