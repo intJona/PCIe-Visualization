@@ -85,7 +85,7 @@ GPU/engine utilization, and the request lifecycle timeline.
 | GPU view | `GPU N` (pick specific GPUs), `All GPUs` (one line per GPU), or `Total (Sum)` (GPUs summed/averaged into one line). |
 | Rows to Display | Show/hide Row 1, 2, and 3 independently to reclaim vertical space. |
 | Row 1: PCIe Data Transfer | `Total`, `TX`, `RX`, or (single-run view only) `TX+RX` together. |
-| Row 2: Engine Utilization | Always on when shown: KV cache % and preemption events. |
+| Row 2: KV cache | Always on when shown: KV cache % and preemption events. |
 | Row 3: Request Lifecycle | Always on when shown — cumulative token count over time plus a per-request TTFT marker. |
 
 ### Glossary
@@ -93,8 +93,10 @@ GPU/engine utilization, and the request lifecycle timeline.
 - **PCIe H2D / D2H** — Host-to-Device / Device-to-Host: bytes per second moving *into* vs *out
   of* the GPU over PCIe. `Total` is H2D + D2H combined.
 - **SM / memory controller utilization** — still recorded in `raw-metrics-*.csv` (`sm_util`,
-  `mem_util`) but not plotted: this workstation's GPUs don't support NVML's GPM API, so these
-  fall back to a coarse, easily-misread utilization estimate rather than true SM occupancy.
+  `mem_util`) but not plotted: this workstation's GPUs don't support NVML's GPM (GPU Performance
+  Monitoring) API, which measures true per-SM occupancy on Hopper+/some Ampere GPUs. Without it,
+  these columns fall back to a coarse "was any kernel running" bit that pins near 100% under
+  continuous batching and is easy to misread as true SM occupancy.
 - **KV cache usage** — percent of vLLM's GPU KV cache (the storage holding every request's past
   attention keys/values, so it doesn't have to be recomputed each token) currently occupied.
   Running near 100% causes preemptions (requests paused/evicted to free space).

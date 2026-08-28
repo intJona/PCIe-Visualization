@@ -89,6 +89,14 @@ rebuilt from whichever rows are still on, see row_index in main()), then Row 1 (
 Row 2 (engine utilization) pickers, so each widget appears in the same top-to-bottom order it
 affects the plot.
 
+Milestone dimension lines (Row 3 only): CAD-drawing-style comparisons (witness lines + a
+dimension bar + delta label) between two runs' TTFT, run end/duration, first preemption, and
+KV cache fill start. Only drawn with exactly 2 runs selected in total -- more than 2 has no
+single well-defined "other" run to measure against, and "Run end" / "Total duration" collapse
+into one dimension rather than two because every run is time-aligned to start at 0 (see
+load_run()), so the delta between two runs' end timestamps already equals the delta between
+their total durations.
+
 Usage:
   streamlit run dashboard.py
 """
@@ -267,10 +275,21 @@ def load_run(entry):
 def clip_negative_time(cols):
     """Drop every sample recorded before this run's t=0 -- telemetry polling starts slightly
     before the first vLLM request is actually sent, so a few leading rows are otherwise
-    negative once shifted to align with the first request. Keeps every column in sync."""
+    negative once shifted to align with the first request. Keeps every column in sync.
+    The single most recent pre-zero sample is kept and clamped to t=0 rather than dropped too --
+    otherwise the trace's first visible point is whatever the next poll after t=0 happened to
+    land on (up to one full poll interval into the run, e.g. mid-prefill for a long prompt),
+    which reads as the trace starting late AND at an already-elevated value. Keeping the last
+    pre-request sample instead anchors it to the true state at request start (e.g. idle KV
+    cache), with no gap."""
     ts = cols["timestamp"]
     start = next((i for i, t in enumerate(ts) if t >= 0), len(ts))
-    return {k: v[start:] for k, v in cols.items()}
+    if start > 0:
+        start -= 1
+    out = {k: v[start:] for k, v in cols.items()}
+    if out["timestamp"]:
+        out["timestamp"][0] = 0.0
+    return out
 
 
 def add_pcie_util_traces(fig, ts, total, d2h, h2d, color, label, pcie_mode, row):
@@ -325,7 +344,7 @@ def main():
         cfg = configs[key]
         run_nums = [r["run"] for r in cfg["runs"]]
         chosen = st.sidebar.multiselect(
-            cfg["label"], run_nums, default=run_nums, key=f"runs_{key}",
+            cfg["label"], run_nums, default=run_nums[:1], key=f"runs_{key}",
         )
         if chosen:
             selected_runs[key] = set(chosen)
@@ -376,18 +395,18 @@ def main():
     gpu_aggregate = gpu_view == "Total (Sum)"
     selected_gpus = set(gpu_list)
     if max_gpus_available and not selected_gpus:
-        st.sidebar.caption("No GPU selected -- the PCIe row will be empty (Engine Utilization "
+        st.sidebar.caption("No GPU selected -- the PCIe row will be empty (KV cache "
                             "and Request Lifecycle are per-run, not per-GPU, so unaffected).")
 
     st.sidebar.header("Rows to Display")
     row_choices = st.sidebar.pills(
-        "Show", ["PCIe", "Engine Utilization", "Request Lifecycle"], selection_mode="multi",
-        default=["PCIe", "Engine Utilization", "Request Lifecycle"],
+        "Show", ["PCIe", "KV cache", "Request Lifecycle"], selection_mode="multi",
+        default=["PCIe", "KV cache", "Request Lifecycle"],
         help="Hide a row entirely to reclaim vertical space -- each row's own controls below "
              "still apply whenever it's shown again.",
     )
     show_pcie_row = "PCIe" in row_choices
-    show_util_row = "Engine Utilization" in row_choices
+    show_util_row = "KV cache" in row_choices
     show_lifecycle_row = "Request Lifecycle" in row_choices
 
     st.sidebar.header("Row 1: PCIe Data Transfer")
@@ -402,7 +421,7 @@ def main():
         disabled=not show_pcie_row,
     )
 
-    st.sidebar.header("Row 2: Engine Utilization")
+    st.sidebar.header("Row 2: KV cache")
     show_kv = True    
     st.sidebar.caption("Always on when shown: KV cache % (from /metrics CSVs) and preemption events (from engine-metrics CSVs). ")
 
@@ -411,6 +430,18 @@ def main():
     st.sidebar.caption("Always on when shown: token timeline + per-request TTFT (from vLLM "
                         "bench's own client data). Server-measured prefill/queue time is in the "
                         "summary table below the chart instead.")
+    show_dimensions = st.sidebar.checkbox(
+        "Show milestone dimensions", value=True,
+        help="CAD-style dimension lines comparing TTFT, run end/duration, first preemption, "
+             "and KV cache fill start -- only drawn when exactly 2 runs are selected.",
+    )
+    kv_fill_threshold = st.sidebar.number_input(
+        "KV cache fill-start threshold (%)", min_value=0.0, max_value=100.0, value=1.0, step=0.5,
+        help='"KV cache fill start" dimension = first time KV cache usage crosses this percentage.',
+        disabled=not show_dimensions,
+    )/100.0
+    if total_selected_runs != 2:
+        st.sidebar.caption(f"Dimensions need exactly 2 selected runs (currently {total_selected_runs}).")
 
     if single_mode:
         st.sidebar.caption("Single-run view -- color = GPU, shade = Configuration. "
@@ -448,6 +479,7 @@ def main():
         st.warning("None of the selected runs have usable data (missing start_times/ttfts/itls).")
         return
     single_run = len(loaded) == 1
+    two_run = len(loaded) == 2
 
     # Dynamic row layout -- only rows toggled on in "Rows to Display" get a subplot slot, so
     # hiding a row reclaims its vertical space instead of leaving a blank panel. row_index maps
@@ -455,7 +487,7 @@ def main():
     # earlier row is hidden), so every add_trace/add_vrect/add_vline call below stays correct.
     row_defs = [
         ("pcie", "PCIe Data Transfer (MiB/s)", 0.4, show_pcie_row),
-        ("util", "Engine Utilization (%)", 0.3, show_util_row),
+        ("util", "KV Cache Usage (%)", 0.3, show_util_row),
         ("lifecycle", "Request Lifecycle Timeline", 0.3, show_lifecycle_row),
     ]
     active_rows = [(name, title, weight) for name, title, weight, shown in row_defs if shown]
@@ -551,22 +583,91 @@ def main():
     # Prefill/decode phase shading is only meaningful for a single displayed run -- with more
     # than one run active, overlapping vrects from different runs would stack into a visually
     # confusing muddle rather than showing either run's phases clearly.
+    PREFILL_COLOR, DECODE_COLOR = "#FFEB3B", "#66BB6A"
+    # Guaranteed minimum on-screen width (in pixels) for the phase bands below. A phase that's
+    # genuinely tiny relative to the full run (e.g. a short prefill before a long decode) would
+    # otherwise render as a sliver too thin to see or click on. `xsizemode="pixel"` shapes are
+    # sized in screen pixels rather than data units, so we layer one small pixel-anchored chip at
+    # each phase's start *underneath* the real (data-proportional) vrect band. At the default
+    # zoom the chip is what's actually visible; once the user zooms in far enough that the real
+    # band's true width exceeds MIN_PHASE_PIXELS, the real band simply grows past the chip and
+    # takes over -- i.e. it "self-corrects" to the true width with no callback/JS needed.
+    MIN_PHASE_PIXELS = 10
     if single_run:
         _, entry, data, color, label = loaded[0]
         run_end = data["events"][-1] if data["events"] else data["ttft"]
-        # Annotation text only on the topmost active row -- row="all" would otherwise repeat the
-        # same label on every subplot row, which is redundant clutter since x is shared.
-        top_row = min(row_index.values())
         for row in row_index.values():
-            annotate = True # show on all rows to avoid "New Text" clutter on other rows, but can be set to "row == top_row" if you want to only annotate the top row
-            fig.add_vrect(x0=0, x1=data["ttft"], fillcolor="#FFEB3B", opacity=0.28, line_width=0,
-                          row=row, col=1,
-                          annotation_text="Prefill (TTFT)" if annotate else None,
-                          annotation_position="top left")
-            fig.add_vrect(x0=data["ttft"], x1=run_end, fillcolor="#66BB6A", opacity=0.22, line_width=0,
-                          row=row, col=1,
-                          annotation_text="Decode" if annotate else None,
-                          annotation_position="top left")
+            yref = "y domain" if row == 1 else f"y{row} domain"
+            # xsizemode="pixel" makes x0/x1 pixel offsets *from xanchor*, not data coordinates --
+            # xanchor must be set explicitly to the phase's real start, or the chip is
+            # positioned relative to an undefined anchor instead of the intended boundary.
+            fig.add_shape(type="rect", xanchor=0, x0=0, x1=MIN_PHASE_PIXELS, xsizemode="pixel",
+                          y0=0, y1=1, yref=yref, fillcolor=PREFILL_COLOR, opacity=0.28,
+                          line_width=0, row=row, col=1)
+            fig.add_shape(type="rect", xanchor=data["ttft"], x0=0, x1=MIN_PHASE_PIXELS,
+                          xsizemode="pixel", y0=0, y1=1, yref=yref, fillcolor=DECODE_COLOR,
+                          opacity=0.22, line_width=0, row=row, col=1)
+            fig.add_vrect(x0=0, x1=data["ttft"], fillcolor=PREFILL_COLOR, opacity=0.28,
+                          line_width=0, row=row, col=1)
+            fig.add_vrect(x0=data["ttft"], x1=run_end, fillcolor=DECODE_COLOR, opacity=0.22,
+                          line_width=0, row=row, col=1)
+
+    # Milestone dimension lines -- CAD-drawing-style comparison, only meaningful (and only
+    # drawn) for exactly 2 selected runs: more than 2 has no single well-defined "other" run to
+    # measure against, and 1 run has nothing to compare against at all. "Run end" and "Total
+    # duration" collapse into one dimension (not two) because every run is time-aligned to start
+    # at 0 (see load_run()), so the delta between two runs' end timestamps IS the delta between
+    # their total durations -- drawing both would just be the same line twice.
+    if show_dimensions and two_run and "lifecycle" in row_index:
+        lifecycle_row = row_index["lifecycle"]
+        dim_xref = "x" if lifecycle_row == 1 else f"x{lifecycle_row}"
+        dim_yref = "y domain" if lifecycle_row == 1 else f"y{lifecycle_row} domain"
+
+        def _milestones(data):
+            run_end = data["events"][-1] if data["events"] else data["ttft"]
+            kv_start = None
+            ec = data["engine_cols"]
+            if ec is not None:
+                for t, v in zip(ec["timestamp"], ec["kv_cache_usage_perc"]):
+                    if v * 100 >= kv_fill_threshold:
+                        kv_start = t
+                        break
+            return {
+                "TTFT": data["ttft"],
+                "Run end / duration": run_end,
+                "First preemption": data["preempt_events"][0] if data["preempt_events"] else None,
+                "KV cache fill start": kv_start,
+            }
+
+        color_a, color_b = loaded[0][3], loaded[1][3]
+        m_a, m_b = _milestones(loaded[0][2]), _milestones(loaded[1][2])
+        dim_y = 0.95
+        for name in ("TTFT", "Run end / duration", "First preemption", "KV cache fill start"):
+            xa, xb = m_a[name], m_b[name]
+            if xa is None or xb is None:
+                continue  # missing on at least one run (e.g. no preemptions) -- nothing to compare
+            lo, hi = sorted((xa, xb))
+            mid = (lo + hi) / 2
+            # Witness lines colored by each run's own established color (same one used for its
+            # token curve/KV trace/sidebar swatch) -- the only way to tell which side is which
+            # run, since both x values can land on either side depending on which run was faster.
+            fig.add_shape(type="line", x0=xa, x1=xa, y0=dim_y - 0.035, y1=dim_y + 0.035,
+                          xref=dim_xref, yref=dim_yref, line=dict(color=color_a, width=2))
+            fig.add_shape(type="line", x0=xb, x1=xb, y0=dim_y - 0.035, y1=dim_y + 0.035,
+                          xref=dim_xref, yref=dim_yref, line=dict(color=color_b, width=2))
+            fig.add_shape(type="line", x0=lo, x1=hi, y0=dim_y, y1=dim_y,
+                          xref=dim_xref, yref=dim_yref, line=dict(color="#555", width=1.5))
+            if hi - lo > 1e-9:
+                # Two inward-pointing arrowheads meeting at the midpoint -- Plotly has no native
+                # double-headed arrow, so this is built from two single-headed ones sharing a tail.
+                for end in (lo, hi):
+                    fig.add_annotation(x=end, y=dim_y, ax=mid, ay=dim_y, xref=dim_xref, yref=dim_yref,
+                                        axref=dim_xref, ayref=dim_yref, showarrow=True, arrowhead=2,
+                                        arrowsize=1, arrowwidth=1.5, arrowcolor="#555", text="")
+            fig.add_annotation(x=mid, y=dim_y, xref=dim_xref, yref=dim_yref,
+                                text=f"{name}: {hi - lo:.3f}s", showarrow=False, yshift=11,
+                                font=dict(size=11, color="#333"), bgcolor="rgba(255,255,255,0.8)")
+            dim_y -= 0.14
 
     if "pcie" in row_index:
         fig.update_yaxes(title_text="MiB/s", row=row_index["pcie"], col=1)
@@ -598,6 +699,29 @@ def main():
             }
         },
     )
+
+    if single_run:
+        # Phase labels live here instead of as in-chart annotations -- inline text got cramped
+        # and overlapping when a phase band was very short, especially now that bands can be as
+        # thin as MIN_PHASE_PIXELS.
+        st.markdown(
+            f'<span style="background-color:{PREFILL_COLOR};opacity:0.6;padding:2px 10px;'
+            f'border-radius:3px;">&nbsp;</span>&nbsp;Prefill'
+            f'&nbsp;&nbsp;&nbsp;&nbsp;'
+            f'<span style="background-color:{DECODE_COLOR};opacity:0.6;padding:2px 10px;'
+            f'border-radius:3px;">&nbsp;</span>&nbsp;Decode',
+            unsafe_allow_html=True,
+        )
+
+    if show_dimensions and two_run and "lifecycle" in row_index:
+        # Color key for the dimension witness ticks above -- each run's tick matches its own
+        # established color, same convention as the sidebar's per-run swatches.
+        st.markdown(
+            f'<span style="color:{loaded[0][3]};">&#9679;</span>&nbsp;{loaded[0][4]}'
+            f'&nbsp;&nbsp;&nbsp;&nbsp;'
+            f'<span style="color:{loaded[1][3]};">&#9679;</span>&nbsp;{loaded[1][4]}',
+            unsafe_allow_html=True,
+        )
 
     if summary_rows:
         st.caption("Server-measured prefill/queue time -- mean over every request completed "

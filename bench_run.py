@@ -57,7 +57,7 @@ ENGINE_METRIC_PATTERNS = {
     "queue_time_count": re.compile(r"^vllm:request_queue_time_seconds_count\{[^}]*\}\s+([0-9.eE+-]+)", re.MULTILINE),
 }
 
-# Lifetime-cumulative metrics that must be baselined to each run's first sample (see comments above).
+# Lifetime-cumulative metrics that must be baselined to a pre-run snapshot (see comments above).
 CUMULATIVE_METRICS = (
     "request_success_total", "prefill_time_sum", "prefill_time_count", "queue_time_sum", "queue_time_count",
 )
@@ -160,33 +160,43 @@ def gpu_monitor(rows, stop_event, start_time, anchor_holder, sample_interval=0.0
               f"dropped this run due to NVML errors (last error: {last_error}).")
 
 
-def poll_engine_metrics(rows, stop_event, base_url, start_time, sample_interval=0.5):
+def fetch_engine_metrics(url):
+    """One-shot /metrics fetch + parse. Returns a {metric_name: value} dict, or None if the
+    endpoint is unreachable."""
+    try:
+        with urllib.request.urlopen(url, timeout=1.0) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None
+
+    values = {}
+    for name, pattern in ENGINE_METRIC_PATTERNS.items():
+        matches = [float(m) for m in pattern.findall(text)]
+        if not matches:
+            values[name] = float("nan")
+        elif name == "kv_cache_usage_perc":
+            values[name] = max(matches)
+        else:
+            values[name] = sum(matches)
+    return values
+
+
+def poll_engine_metrics(rows, stop_event, base_url, start_time, baseline, sample_interval=0.5):
     """Poll vLLM's own /metrics endpoint for engine-side state. Disables itself (returns) the
-    first time the endpoint is unreachable -- best-effort enrichment, never fatal."""
+    first time the endpoint is unreachable -- best-effort enrichment, never fatal.
+    baseline is a snapshot fetched by the caller BEFORE this run's subprocess was launched --
+    NOT this thread's own first sample (the old approach), which could race a fast single-prompt
+    request: if that request's prefill already completed before this thread's first poll landed,
+    the completion would be silently absorbed into the baseline and permanently lost (the run's
+    one and only completion, with no later request in the run to re-trigger a nonzero delta)."""
     url = base_url.rstrip("/") + "/metrics"
-    baseline = None
-    prev = None
+    prev = dict(baseline)
     while not stop_event.is_set():
-        try:
-            with urllib.request.urlopen(url, timeout=1.0) as resp:
-                text = resp.read().decode("utf-8", errors="replace")
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
-            print(f"Warning: engine metrics endpoint unreachable ({url}: {e}); skipping engine metrics.")
+        values = fetch_engine_metrics(url)
+        if values is None:
+            print(f"Warning: engine metrics endpoint unreachable ({url}); skipping engine metrics.")
             return
 
-        values = {}
-        for name, pattern in ENGINE_METRIC_PATTERNS.items():
-            matches = [float(m) for m in pattern.findall(text)]
-            if not matches:
-                values[name] = float("nan")
-            elif name == "kv_cache_usage_perc":
-                values[name] = max(matches)
-            else:
-                values[name] = sum(matches)
-
-        if baseline is None:
-            baseline = {k: values[k] for k in CUMULATIVE_METRICS}
-            prev = dict(baseline)
         completed_this_run = values["request_success_total"] - baseline["request_success_total"]
         # Windowed deltas (since the PREVIOUS sample, not run start) -- see the CUMULATIVE_METRICS
         # comment above for why run-start baselining would be wrong here.
@@ -214,16 +224,19 @@ def topic_dirname(detail):
     return detail.strip().lower().replace(" ", "_")
 
 
-def run_warmup():
-    """Fire a single throwaway request (1 prompt, 1 input/output token) before any logged runs
-    begin, to absorb one-time cold-start costs (CUDA/cuBLAS kernel selection, NCCL channel
-    setup) that would otherwise inflate the TTFT of whatever the first LOGGED run happens to
-    be. No --save-result, so nothing from this is written to disk."""
+def run_warmup(num_prompts, input_len):
+    """Fire a single throwaway request matching the upcoming shape (same num_prompts/input_len,
+    a short output_len) before that shape's first logged run, to absorb the one-time cost of CUDA
+    graph capture / kernel-autotune / KV-block first-touch that's keyed to this exact (batch size,
+    input_len) -- a mismatched shape (e.g. input_len=1) wouldn't hit those same cached code paths,
+    leaving run 1 of the real shape just as slow as with no warmup at all. output_len is kept short
+    since one decode step is enough to also warm the decode-phase path without paying for a full
+    generation. No --save-result, so nothing from this is written to disk."""
     cmd = [
-        "vllm", "bench", "serve", "--input-len", "1", "--output-len", "1",
-        "--num-prompts", "1", "--request-rate", "inf", "--trust-remote-code", "--ignore-eos",
+        "vllm", "bench", "serve", "--input-len", str(input_len), "--output-len", "8",
+        "--num-prompts", str(num_prompts), "--request-rate", "inf", "--trust-remote-code", "--ignore-eos",
     ]
-    print("Warming up server (1 throwaway request, output discarded)...")
+    print(f"Warming up server ({num_prompts} prompts, {input_len} input tokens, output discarded)...")
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
     except (subprocess.CalledProcessError, KeyboardInterrupt) as e:
@@ -238,7 +251,11 @@ def run_bench(detail, num_prompts, output_len, input_len, run_idx, engine_metric
     # silently overwrite a previous run's files.
     run_id = f"{num_prompts}p_{input_len}i_{output_len}o_run{run_idx}"
 
-    gpu_rows, engine_rows, stop_event = [], [], Event()
+    gpu_rows, engine_rows = [], []
+    # Separate stop events -- the engine poller gets to keep running a little past the
+    # subprocess exiting (see the grace-period comment below), while GPU telemetry stops
+    # immediately since NVML has no equivalent lagging-flush issue.
+    stop_event, engine_stop_event = Event(), Event()
     # Captured together, back-to-back, in the main thread -- BEFORE any thread/NVML/subprocess
     # work starts -- so t0_monotonic is guaranteed to correspond to the exact same real-world
     # instant as start_time (the CSV's own t=0). Letting gpu_monitor() capture t0_monotonic
@@ -252,9 +269,15 @@ def run_bench(detail, num_prompts, output_len, input_len, run_idx, engine_metric
 
     engine_thread = None
     if engine_metrics_url:
-        engine_thread = Thread(target=poll_engine_metrics,
-                                args=(engine_rows, stop_event, engine_metrics_url, start_time))
-        engine_thread.start()
+        # Fetched synchronously here, before the subprocess below can send a single request --
+        # guaranteed to precede any completion this run could produce (see poll_engine_metrics()).
+        baseline = fetch_engine_metrics(engine_metrics_url.rstrip("/") + "/metrics")
+        if baseline is None:
+            print(f"Warning: engine metrics endpoint unreachable ({engine_metrics_url}); skipping engine metrics.")
+        else:
+            engine_thread = Thread(target=poll_engine_metrics,
+                                    args=(engine_rows, engine_stop_event, engine_metrics_url, start_time, baseline))
+            engine_thread.start()
 
     json_name = f"bench-{run_id}.json"
     cmd = [
@@ -272,6 +295,14 @@ def run_bench(detail, num_prompts, output_len, input_len, run_idx, engine_metric
         stop_event.set()
         gpu_thread.join()
         if engine_thread is not None:
+            # vLLM only observes request_prefill_time_seconds/request_queue_time_seconds/
+            # request_success_total when a request lands in iteration_stats.finished_requests --
+            # i.e. at full completion, which can lag slightly behind the client already having
+            # received its last token and exited. Stopping the poller immediately on subprocess
+            # exit risks permanently missing a single-prompt run's one-and-only completion event,
+            # so it gets a couple more poll intervals to catch that delayed flush first.
+            time.sleep(1.5)
+            engine_stop_event.set()
             engine_thread.join()
 
     n_gpus = anchor.get("num_gpus", 0)
@@ -312,14 +343,15 @@ def main():
     parser.add_argument("--engine-metrics-url", type=str, default="http://localhost:8000",
                         help="Base URL of the running `vllm serve` server. Pass '' to disable.")
     parser.add_argument("--no-warmup", action="store_true",
-                        help="Skip the throwaway warm-up request normally run once before the first "
-                             "logged run, to absorb one-time CUDA/NCCL cold-start costs.")
+                        help="Skip the throwaway warm-up request normally run once per distinct "
+                             "prompt count (same shape as the real runs), to absorb one-time "
+                             "CUDA graph/kernel-autotune cold-start costs before that shape's run 1.")
     args = parser.parse_args()
 
-    if not args.no_warmup:
-        run_warmup()
-
     for num_prompts in args.prompts:
+        if not args.no_warmup:
+            run_warmup(num_prompts, args.input_len)
+
         for run_idx in range(1, args.runs + 1):
             print(f"=== {args.detail}: {num_prompts} prompts, run {run_idx}/{args.runs} ===")
             run_bench(args.detail, num_prompts, args.output_len, args.input_len, run_idx,
