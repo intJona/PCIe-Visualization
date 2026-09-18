@@ -62,6 +62,13 @@ streamlit run dashboard.py
 Opens in your browser. Pick a configuration and its runs in the sidebar to plot PCIe transfer,
 GPU/engine utilization, and the request lifecycle timeline.
 
+## Storage location
+
+Logs are written to `logs/` inside the repo by default, so a fresh clone works with no setup. To
+point at a shared/network location instead (e.g. so logs survive a re-clone), copy
+`.storage-config.example` to `.storage-config` (gitignored) and set the path there, or set the
+`PCIE_VIZ_LOGS_DIR` environment variable. Precedence: env var > `.storage-config` > `logs/`.
+
 ## Flags and terminology
 
 ### `bench_run.py`

@@ -7,3 +7,6 @@ example scripts (do not git)/
 
 # Generated benchmark output -- regenerable via bench_run.py, would grow unbounded in history
 logs/
+
+# Machine-local override of where results/logs live -- see .storage-config.example
+.storage-config

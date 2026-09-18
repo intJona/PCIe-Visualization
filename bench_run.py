@@ -29,10 +29,11 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
 from threading import Event, Thread
 
 import pynvml
+
+from storage_config import resolve_logs_root
 
 ENGINE_METRIC_PATTERNS = {
     "num_requests_running": re.compile(r"^vllm:num_requests_running\{[^}]*\}\s+([0-9.eE+-]+)", re.MULTILINE),
@@ -244,7 +245,7 @@ def run_warmup(num_prompts, input_len):
 
 
 def run_bench(detail, num_prompts, output_len, input_len, run_idx, engine_metrics_url):
-    log_dir = Path("./logs") / topic_dirname(detail)
+    log_dir = resolve_logs_root() / topic_dirname(detail)
     log_dir.mkdir(parents=True, exist_ok=True)
     # Encode the full parameter set (not just prompts/run) into every filename -- otherwise
     # sweeping the same --detail/--prompts with a different --input-len/--output-len would

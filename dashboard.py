@@ -111,7 +111,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-LOGS_ROOT = Path("./logs")
+from storage_config import resolve_logs_root
+
+LOGS_ROOT = resolve_logs_root()
 FILENAME_RE = re.compile(
     r"^bench-(?P<prompts>\d+)p_(?P<input>\d+)i_(?P<output>\d+)o_run(?P<run>\d+)\.json$"
 )
