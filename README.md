@@ -19,6 +19,11 @@ pip install -r requirements.txt
 fails on them, install vLLM first per the [official instructions](https://docs.vllm.ai/en/latest/getting_started/installation/index.html)
 for your CUDA version, then re-run `pip install -r requirements.txt` to pick up the rest.
 
+`requirements.txt` installs both halves of this repo. If you only need one:
+- `requirements-bench.txt` — `bench_run.py` (vLLM + NVML telemetry), needs a GPU.
+- `requirements-dashboard.txt` — `dashboard.py` only (Streamlit + Plotly), e.g. for serving the
+  dashboard from a separate machine that just reads `logs/` and doesn't run benchmarks.
+
 ## Serving the model
 
 Start the vLLM server first, in its own terminal — the commands below are what we've been using
