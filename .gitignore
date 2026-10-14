@@ -10,3 +10,7 @@ logs/
 
 # Machine-local override of where results/logs live -- see .storage-config.example
 .storage-config
+
+# Disk-backed scan cache (see cache_store.py) -- regenerable, machine-local
+.cache/
+

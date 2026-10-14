@@ -105,12 +105,14 @@ import bisect
 import json
 import math
 import re
+import time
 from pathlib import Path
 
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+import cache_store
 from storage_config import resolve_logs_root
 
 LOGS_ROOT = resolve_logs_root()
@@ -159,6 +161,8 @@ def discover_runs():
     group them into "configurations" -- one per distinct (topic, prompts, input_len, output_len)
     combination, each holding its own list of runs. That full parameter set (not just the topic
     folder) is what actually distinguishes one displayable trace-group from another.
+    LOGS_ROOT lives on a network share where just this directory scan (no file reads) measured
+    ~70s, so results are disk-cached by get_configs() below rather than re-scanned every rerun.
     Returns {config_key: {"topic", "prompts", "input", "output", "label", "runs": [...]}}."""
     configs = {}
     if not LOGS_ROOT.exists():
@@ -194,6 +198,31 @@ def discover_runs():
     return configs
 
 
+FIRST_SCAN_NOTICE = (
+    "No cached data found yet. The first scan has to walk every topic folder over the network "
+    "share and can take a minute or more. Please keep this tab open -- once it finishes, the "
+    "result is cached to disk so restarts load instantly, until you click Refresh."
+)
+REFRESH_NOTICE = "Rescanning LOGS_ROOT over the network share -- this can take a minute or more."
+
+
+def get_configs(force_refresh: bool):
+    """Disk-cached wrapper around discover_runs() -- see cache_store.py."""
+    configs, meta = (None, None) if force_refresh else cache_store.load_configs(LOGS_ROOT)
+    if configs is not None:
+        return configs, meta, True
+
+    banner = st.empty()
+    banner.warning(REFRESH_NOTICE if force_refresh else FIRST_SCAN_NOTICE)
+    t0 = time.time()
+    with st.spinner("Scanning LOGS_ROOT..."):
+        configs = discover_runs()
+    meta = cache_store.make_meta(t0)
+    cache_store.save_configs(LOGS_ROOT, configs, meta)
+    banner.empty()
+    return configs, meta, False
+
+
 def read_csv(path):
     """Plain CSV -> {col: [float, ...]}. None if the file is missing/empty."""
     if not path.exists():
@@ -206,8 +235,10 @@ def read_csv(path):
     return {headers[i]: [row[i] for row in rows] for i in range(len(headers))}
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def load_run(entry):
-    """Load + time-align one run: shifts CSV/engine timestamps and reconstructs the full
+    """Cached (ttl=300s): reads full JSON/CSV files over the network share per selected run.
+    Load + time-align one run: shifts CSV/engine timestamps and reconstructs the full
     token-generation timeline so the first vLLM request lands at x=0 (per meta.json's
     t0_monotonic, the CLOCK_MONOTONIC reading at the CSV's own t=0 -- the same clock vLLM's own
     'start_times' use). "ttft" is the time of the first token emitted anywhere in the run --
@@ -319,7 +350,11 @@ def main():
     st.set_page_config(layout="wide", page_title="vLLM PCIe Benchmark Dashboard")
     st.title("vLLM PCIe / GPU / Token Benchmark Dashboard")
 
-    configs = discover_runs()
+    force_refresh = st.sidebar.button("Refresh data", help="Re-scan LOGS_ROOT instead of using the cached scan")
+    configs, meta, was_cached = get_configs(force_refresh)
+    if meta:
+        age = f"{time.time() - meta['generated_at']:.0f}s ago" if was_cached else "just now"
+        st.sidebar.caption(f"Scan cached {age} (took {meta['duration_seconds']}s)")
     if not configs:
         st.warning(f"No runs found under {LOGS_ROOT}/. Run bench_run.py first.")
         return
