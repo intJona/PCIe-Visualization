@@ -1,13 +1,29 @@
 # PCIe Visualization
 
-Benchmark vLLM, capture PCIe/GPU/engine telemetry alongside it, and view the results in an
-interactive dashboard.
+Runs a vLLM serving benchmark on NVIDIA GPUs while recording PCIe, GPU and engine telemetry,
+then shows the results in an interactive dashboard. Use it to see how a PCIe configuration
+(topology, lane width, ...) affects tensor-parallel inference.
 
-- [`bench_run.py`](bench_run.py) — runs `vllm bench serve` while polling GPU (NVML) and engine
-  (`/metrics`) telemetry in the background, and writes everything to `./logs/`.
-- [`dashboard.py`](dashboard.py) — a Streamlit + Plotly viewer for that `./logs/` output.
+- [`bench_run.py`](bench_run.py) — runs `vllm bench serve` and records telemetry to `./logs/`
+- [`dashboard.py`](dashboard.py) — Streamlit + Plotly viewer for `./logs/`
 
-## Setup
+## Why this exists
+
+`vllm bench serve` reports request-level latency and throughput, but nothing about what the
+PCIe link was doing at the time. `bench_run.py` wraps it so that, in one command:
+
+- **PCIe traffic** (H2D / D2H per GPU, via NVML) is sampled in the background during the run
+- **Engine state** (KV cache usage, queue, preemptions, prefill time) is sampled from vLLM's
+  `/metrics` endpoint
+- **Everything shares one clock** and lands in a fixed file layout, so the dashboard can line
+  up PCIe traffic with the request timeline
+- **Runs are repeatable and labelled** (`--detail`, `--runs`), so different PCIe configurations
+  can be compared side by side
+
+## Requirements
+
+- Linux, 1+ NVIDIA GPUs with a working vLLM install (tensor parallel needs 2+)
+- Python environment with the packages in `requirements.txt`
 
 ```bash
 conda create -n vllm python=3.13
@@ -15,111 +31,88 @@ conda activate vllm
 pip install -r requirements.txt
 ```
 
-`vllm`/`torch` are hardware- and CUDA-version-sensitive. If `pip install -r requirements.txt`
-fails on them, install vLLM first per the [official instructions](https://docs.vllm.ai/en/latest/getting_started/installation/index.html)
-for your CUDA version, then re-run `pip install -r requirements.txt` to pick up the rest.
+`vllm`/`torch` are sensitive to your CUDA version. If the install fails on them, install vLLM
+first following the [official instructions](https://docs.vllm.ai/en/latest/getting_started/installation/index.html),
+then re-run `pip install -r requirements.txt`.
 
-`requirements.txt` installs both halves of this repo. If you only need one:
-- `requirements-bench.txt` — `bench_run.py` (vLLM + NVML telemetry), needs a GPU.
-- `requirements-dashboard.txt` — `dashboard.py` only (Streamlit + Plotly), e.g. for serving the
-  dashboard from a separate machine that just reads `logs/` and doesn't run benchmarks.
+Install only what you need:
 
-## Serving the model
+- `requirements-bench.txt` — `bench_run.py` (vLLM + NVML), needs a GPU
+- `requirements-dashboard.txt` — `dashboard.py` only (Streamlit + Plotly); useful for viewing
+  `logs/` from a machine that does not run benchmarks
 
-Start the vLLM server first, in its own terminal — the commands below are what we've been using
-to test with (Qwen3-14B-FP8 across 2 GPUs), flags and all:
+## 1. Start the vLLM server
+
+In its own terminal:
 
 ```bash
-conda activate vllm
-
-export CUDA_HOME=/usr/local/cuda
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-export VLLM_USE_FLASHINFER_SAMPLER=0
-
-CUDA_VISIBLE_DEVICES=0,1 vllm serve /home/intel/.cache/huggingface/hub/models--Qwen--Qwen3-14B-FP8/snapshots/9a283b4a5efbc09ce247e0ae5b02b744739e525a/ \
+CUDA_VISIBLE_DEVICES=0,1 vllm serve /path/to/model \
     --tensor-parallel-size 2 \
     --max-model-len auto \
     --disable-custom-all-reduce \
     --enforce-eager --no-enable-prefix-caching
 ```
 
-`--no-enable-prefix-caching` matters for benchmarking: it stops vLLM from reusing KV cache
-between prompts, so every request is measured as a genuine cold pass instead of a cache hit.
+Adjust the model, GPU list and tensor-parallel size to your setup. These flags are the ones used
+for testing. `--no-enable-prefix-caching` matters: it stops vLLM reusing KV cache between
+prompts, so every request is a cold pass.
 
-## Running a benchmark
-
-Once the server is up, run a benchmark in a single command — pick a topic label, how many
-prompts to send, how many tokens per prompt/response, and how many times to repeat it:
+## 2. Run a benchmark
 
 ```bash
 python bench_run.py --detail "my_test" --prompts 20 --input-len 200 --output-len 100 --runs 2
 ```
 
-Results land in `logs/my_test/`.
+Results are written to `logs/my_test/`.
 
-## Viewing the dashboard
+| Flag | Default | Description |
+|---|---|---|
+| `--detail` | *required* | Topic label; results go to `logs/<detail>/` |
+| `--prompts` | `1 20` | One or more prompt counts (space-separated); one run set per value |
+| `--input-len` | `8000` | Input tokens per request |
+| `--output-len` | `1000` | Output tokens per request |
+| `--runs` | `1` | Repetitions per prompt count |
+| `--engine-metrics-url` | `http://localhost:8000` | Base URL of the vLLM server for `/metrics`; `""` disables |
+| `--no-warmup` | off | Skip the warm-up request normally sent before the first logged run |
+
+## 3. View the dashboard
 
 ```bash
 streamlit run dashboard.py
 ```
 
-Opens in your browser. Pick a configuration and its runs in the sidebar to plot PCIe transfer,
-GPU/engine utilization, and the request lifecycle timeline.
-
-## Storage location
-
-Logs are written to `logs/` inside the repo by default, so a fresh clone works with no setup. To
-point at a shared/network location instead (e.g. so logs survive a re-clone), copy
-`.storage-config.example` to `.storage-config` (gitignored) and set the path there, or set the
-`PCIE_VIZ_LOGS_DIR` environment variable. Precedence: env var > `.storage-config` > `logs/`.
-
-## Flags and terminology
-
-### `bench_run.py`
-
-| Flag | Default | Description |
-|---|---|---|
-| `--detail` | *required* | Topic label. Runs are written to `logs/<detail>/`. |
-| `--prompts` | `1 20` | One or more prompt counts to benchmark (space-separated), one full run per value. |
-| `--input-len` | `8000` | Input (prompt) tokens per request. |
-| `--output-len` | `1000` | Output tokens generated per request. |
-| `--runs` | `1` | How many times to repeat each prompt count (`bench-..._run1.json`, `_run2.json`, ...). |
-| `--engine-metrics-url` | `http://localhost:8000` | Base URL of the running `vllm serve` server, for polling `/metrics`. Pass `""` to disable. |
-| `--no-warmup` | off | Skip the throwaway warm-up request normally run once before the first logged run, to absorb one-time CUDA/NCCL cold-start cost. |
-
-### `dashboard.py` sidebar
+Pick a configuration and its runs in the sidebar.
 
 | Control | Effect |
 |---|---|
-| Configurations | Selects which (topic, prompts, input/output tokens) combinations to plot. |
-| Runs (per configuration) | Selects which repeated runs of each configuration to plot; a colored dot legend under each picker matches each run's plotted color/shade. |
-| GPU view | `GPU N` (pick specific GPUs), `All GPUs` (one line per GPU), or `Total (Sum)` (GPUs summed/averaged into one line). |
-| Rows to Display | Show/hide Row 1, 2, and 3 independently to reclaim vertical space. |
-| Row 1: PCIe Data Transfer | `Total`, `TX`, `RX`, or (single-run view only) `TX+RX` together. |
-| Row 2: KV cache | Always on when shown: KV cache % and preemption events. |
-| Row 3: Request Lifecycle | Always on when shown — cumulative token count over time plus a per-request TTFT marker. |
+| Configurations | Which (topic, prompts, input/output tokens) combinations to plot |
+| Runs | Which repeated runs to plot |
+| GPU view | `GPU N`, `All GPUs` (one line each) or `Total (Sum)` |
+| Rows to Display | Show or hide rows 1–3 |
+| Row 1: PCIe Data Transfer | `Total`, `TX`, `RX`, or `TX+RX` (single-run view only) |
+| Row 2: KV cache | KV cache % and preemption events |
+| Row 3: Request Lifecycle | Cumulative token count over time with a per-request TTFT marker |
 
-### Glossary
+## Storage
 
-- **PCIe H2D / D2H** — Host-to-Device / Device-to-Host: bytes per second moving *into* vs *out
-  of* the GPU over PCIe. `Total` is H2D + D2H combined.
-- **SM / memory controller utilization** — still recorded in `raw-metrics-*.csv` (`sm_util`,
-  `mem_util`) but not plotted: this workstation's GPUs don't support NVML's GPM (GPU Performance
-  Monitoring) API, which measures true per-SM occupancy on Hopper+/some Ampere GPUs. Without it,
-  these columns fall back to a coarse "was any kernel running" bit that pins near 100% under
-  continuous batching and is easy to misread as true SM occupancy.
-- **KV cache usage** — percent of vLLM's GPU KV cache (the storage holding every request's past
-  attention keys/values, so it doesn't have to be recomputed each token) currently occupied.
-  Running near 100% causes preemptions (requests paused/evicted to free space).
-- **TTFT (Time To First Token)** — wall-clock time from when a request was submitted to when its
-  first output token came back. Measured client-side by `vllm bench serve`, so it's exact but
-  doesn't split out queueing vs. prefill.
-- **Prefill** — the pass over a request's *input* prompt (computing its initial KV cache) before
-  any output tokens can be generated. Compute-heavy and roughly proportional to input length.
-- **Decode** — the token-by-token generation phase after prefill, one output token per step.
-  Memory-bandwidth-bound rather than compute-bound (see SM vs. Mem above).
-- **Queue time** — time a request spent waiting before the engine started processing it at all,
-  separate from prefill itself. Reported only as a run-level average in the summary table (vLLM
-  only records it once a request completes, so it has no honest single instant to plot on a
-  timeline).
+Logs location, highest priority first:
+
+1. `PCIE_VIZ_LOGS_DIR` environment variable
+2. `.storage-config` (gitignored; copy from `.storage-config.example`)
+3. `./logs`
+
+## Glossary
+
+- **PCIe H2D / D2H** — bytes per second moving into / out of the GPU over PCIe. `Total` is both.
+- **SM / memory utilization** — recorded in `raw-metrics-*.csv` (`sm_util`, `mem_util`) but not
+  plotted. Without NVML GPM support on the GPU, `sm_util` is only a coarse "any kernel running"
+  bit that sits near 100% under continuous batching, so it is easy to misread.
+- **KV cache usage** — share of vLLM's GPU KV cache in use. Near 100% causes preemptions
+  (requests paused/evicted to free space).
+- **TTFT** — time from request submission to its first output token, measured client-side by
+  `vllm bench serve`. Includes queueing and prefill.
+- **Prefill** — processing of the input prompt before the first output token; compute-heavy,
+  roughly proportional to input length.
+- **Decode** — token-by-token generation after prefill; typically memory-bandwidth-bound.
+- **Queue time** — time a request waits before the engine starts on it. Shown only as a run-level
+  average, since vLLM records it once a request completes.
